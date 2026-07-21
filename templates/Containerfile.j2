@@ -1,0 +1,64 @@
+FROM {{ gitlab_bootc_base_image }}
+
+ARG GITLAB_REPOSITORY_SETUP_URL="{{ gitlab_repository_setup_url }}"
+ARG GITLAB_PACKAGE_NAME="{{ gitlab_package_name }}"
+ARG GITLAB_PACKAGE_VERSION="{{ gitlab_package_version }}"
+
+# Add the official GitLab RPM repository before installing gitlab-ee.
+RUN set -eux; \
+    dnf -y install \
+        ca-certificates \
+        curl \
+        policycoreutils \
+        openssh-server \
+        perl \
+        chrony \
+        cloud-init \
+        cloud-utils-growpart \
+        rsync \
+        tar \
+        jq \
+        util-linux; \
+    curl --fail --show-error --silent --location \
+        "${GITLAB_REPOSITORY_SETUP_URL}" \
+        --output /tmp/gitlab-repository-setup.sh; \
+    bash /tmp/gitlab-repository-setup.sh; \
+    rm -f /tmp/gitlab-repository-setup.sh; \
+    if [ -n "${GITLAB_PACKAGE_VERSION}" ]; then \
+        dnf -y install "${GITLAB_PACKAGE_NAME}-${GITLAB_PACKAGE_VERSION}"; \
+    else \
+        dnf -y install "${GITLAB_PACKAGE_NAME}"; \
+    fi; \
+    dnf clean all; \
+    rm -rf /var/cache/dnf
+
+# The bootc base image may not include the cloud-user account expected by EC2.
+RUN set -eux; \
+    if ! id ec2-user >/dev/null 2>&1; then \
+        useradd --create-home --groups wheel --shell /bin/bash ec2-user; \
+    else \
+        usermod --append --groups wheel ec2-user; \
+    fi; \
+    install -d -m 0700 -o ec2-user -g ec2-user /home/ec2-user/.ssh; \
+    passwd --lock ec2-user || true
+
+COPY gitlab-firstboot.sh /usr/local/bin/gitlab-firstboot.sh
+COPY gitlab-firstboot.service /usr/lib/systemd/system/gitlab-firstboot.service
+COPY 99-gitlab-image-mode.cfg /etc/cloud/cloud.cfg.d/99-gitlab-image-mode.cfg
+COPY gitlab-firstboot.env.example /usr/share/doc/gitlab-image-mode/gitlab-firstboot.env.example
+
+RUN set -eux; \
+    chmod 0755 /usr/local/bin/gitlab-firstboot.sh; \
+    chmod 0644 /usr/lib/systemd/system/gitlab-firstboot.service; \
+    chmod 0644 /etc/cloud/cloud.cfg.d/99-gitlab-image-mode.cfg; \
+    chmod 0600 /usr/share/doc/gitlab-image-mode/gitlab-firstboot.env.example; \
+    systemctl enable sshd.service; \
+    systemctl enable chronyd.service; \
+    systemctl enable cloud-init.service; \
+    systemctl enable cloud-config.service; \
+    systemctl enable cloud-final.service; \
+    systemctl enable gitlab-runsvdir.service; \
+    systemctl enable gitlab-firstboot.service
+
+# Validate that this remains a bootable container image.
+RUN bootc container lint

@@ -1,0 +1,18 @@
+[Unit]
+Description=Configure Image Mode GitLab on first boot
+Documentation=file:/usr/share/doc/gitlab-image-mode/gitlab-firstboot.env.example
+Wants=network-online.target cloud-final.service
+After=network-online.target cloud-final.service
+ConditionPathExists=/etc/gitlab-firstboot.env
+ConditionPathExists=!/var/lib/gitlab-firstboot/complete
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/gitlab-firstboot.sh
+RemainAfterExit=yes
+TimeoutStartSec=0
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

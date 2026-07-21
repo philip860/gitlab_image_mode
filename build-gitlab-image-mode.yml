@@ -1,0 +1,251 @@
+---
+###############################################################################
+# Build and optionally push a RHEL Image Mode GitLab bootc container image.
+#
+# Expected inventory group:
+#
+#   [image_builder]
+#   image-builder-1.example.com
+#
+# Required on the builder:
+#
+#   - podman
+#   - access to registry.redhat.io/rhel10/rhel-bootc
+#   - enough free space under gitlab_image_build_root
+#
+# Registry credentials should be supplied through an AAP credential,
+# Ansible Vault, or extra variables. Do not commit passwords.
+###############################################################################
+
+- name: Build Image Mode GitLab bootc image
+  hosts: image_builder
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+  serial: 1
+
+  vars:
+    ###########################################################################
+    # Build inputs
+    ###########################################################################
+
+    gitlab_image_build_root: /var/lib/image-mode/gitlab
+    gitlab_image_context_dir: "{{ gitlab_image_build_root }}/context"
+
+    gitlab_bootc_base_image: registry.redhat.io/rhel10/rhel-bootc:latest
+    gitlab_package_name: gitlab-ee
+    gitlab_package_version: ""
+    gitlab_repository_setup_url: >-
+      https://packages.gitlab.com/install/repositories/gitlab/gitlab-ee/script.rpm.sh
+
+    ###########################################################################
+    # Output image
+    ###########################################################################
+
+    gitlab_image_registry: quay.example.com
+    gitlab_image_namespace: image-mode
+    gitlab_image_name: gitlab-rhel10
+    gitlab_image_tag: latest
+    gitlab_image_reference: >-
+      {{ gitlab_image_registry }}/{{ gitlab_image_namespace }}/
+      {{- gitlab_image_name }}:{{ gitlab_image_tag }}
+
+    ###########################################################################
+    # Registry authentication
+    ###########################################################################
+
+    gitlab_registry_username: ""
+    gitlab_registry_password: ""
+    gitlab_registry_validate_certs: true
+
+    gitlab_push_image: false
+    gitlab_force_rebuild: true
+    gitlab_pull_base_image: true
+
+  pre_tasks:
+    - name: PHASE 0 | Validate supported builder operating system
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.os_family == "RedHat"
+          - ansible_facts.architecture == "x86_64"
+        fail_msg: >-
+          This playbook requires an x86_64 Red Hat-family image-builder host.
+
+    - name: PHASE 0 | Validate build variables
+      ansible.builtin.assert:
+        that:
+          - gitlab_bootc_base_image | length > 0
+          - gitlab_image_registry | length > 0
+          - gitlab_image_namespace | length > 0
+          - gitlab_image_name | length > 0
+          - gitlab_image_tag | length > 0
+          - not gitlab_push_image or gitlab_registry_username | length > 0
+          - not gitlab_push_image or gitlab_registry_password | length > 0
+        fail_msg: >-
+          Image coordinates are required. Registry credentials are also
+          required when gitlab_push_image=true.
+
+  tasks:
+    ###########################################################################
+    # PHASE 1 | Prepare builder
+    ###########################################################################
+
+    - name: PHASE 1 | Install container build tools
+      ansible.builtin.dnf:
+        name:
+          - podman
+          - skopeo
+          - jq
+        state: present
+
+    - name: PHASE 1 | Create GitLab image build context
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - path: "{{ gitlab_image_build_root }}"
+          mode: "0750"
+        - path: "{{ gitlab_image_context_dir }}"
+          mode: "0750"
+
+    ###########################################################################
+    # PHASE 2 | Stage immutable image content
+    ###########################################################################
+
+    - name: PHASE 2 | Render Containerfile
+      ansible.builtin.template:
+        src: templates/Containerfile.j2
+        dest: "{{ gitlab_image_context_dir }}/Containerfile"
+        owner: root
+        group: root
+        mode: "0644"
+      register: gitlab_containerfile
+
+    - name: PHASE 2 | Install GitLab first-boot script in build context
+      ansible.builtin.copy:
+        src: files/gitlab-firstboot.sh
+        dest: "{{ gitlab_image_context_dir }}/gitlab-firstboot.sh"
+        owner: root
+        group: root
+        mode: "0755"
+      register: gitlab_firstboot_script
+
+    - name: PHASE 2 | Render GitLab first-boot systemd service
+      ansible.builtin.template:
+        src: templates/gitlab-firstboot.service.j2
+        dest: "{{ gitlab_image_context_dir }}/gitlab-firstboot.service"
+        owner: root
+        group: root
+        mode: "0644"
+      register: gitlab_firstboot_service
+
+    - name: PHASE 2 | Render cloud-init configuration drop-in
+      ansible.builtin.template:
+        src: templates/99-gitlab-image-mode.cfg.j2
+        dest: "{{ gitlab_image_context_dir }}/99-gitlab-image-mode.cfg"
+        owner: root
+        group: root
+        mode: "0644"
+      register: gitlab_cloud_init_config
+
+    - name: PHASE 2 | Render example deployment environment
+      ansible.builtin.template:
+        src: templates/gitlab-firstboot.env.example.j2
+        dest: "{{ gitlab_image_context_dir }}/gitlab-firstboot.env.example"
+        owner: root
+        group: root
+        mode: "0600"
+
+    ###########################################################################
+    # PHASE 3 | Authenticate and pull base image
+    ###########################################################################
+
+    - name: PHASE 3 | Log in to destination registry
+      containers.podman.podman_login:
+        registry: "{{ gitlab_image_registry }}"
+        username: "{{ gitlab_registry_username }}"
+        password: "{{ gitlab_registry_password }}"
+        tlsverify: "{{ gitlab_registry_validate_certs }}"
+      no_log: true
+      when: gitlab_push_image
+
+    - name: PHASE 3 | Pull current bootc base image
+      containers.podman.podman_image:
+        name: "{{ gitlab_bootc_base_image }}"
+        pull: true
+        force: true
+      when: gitlab_pull_base_image
+
+    ###########################################################################
+    # PHASE 4 | Build and validate image
+    ###########################################################################
+
+    - name: PHASE 4 | Build GitLab bootc container image
+      containers.podman.podman_image:
+        name: "{{ gitlab_image_reference }}"
+        path: "{{ gitlab_image_context_dir }}"
+        build:
+          file: Containerfile
+          format: oci
+          cache: "{{ not gitlab_force_rebuild }}"
+          extra_args: >-
+            --label org.opencontainers.image.title=Image-Mode-GitLab
+            --label org.opencontainers.image.description=RHEL-10-bootc-GitLab
+        force: "{{ gitlab_force_rebuild }}"
+        pull: false
+        push: false
+      register: gitlab_image_build
+
+    - name: PHASE 4 | Inspect built image
+      ansible.builtin.command:
+        argv:
+          - podman
+          - image
+          - inspect
+          - "{{ gitlab_image_reference }}"
+      register: gitlab_image_inspect
+      changed_when: false
+
+    - name: PHASE 4 | Validate required image files and commands
+      ansible.builtin.command:
+        argv:
+          - podman
+          - run
+          - --rm
+          - --entrypoint
+          - /bin/bash
+          - "{{ gitlab_image_reference }}"
+          - -ceu
+          - |
+            command -v bootc
+            command -v gitlab-ctl
+            command -v cloud-init
+            command -v sshd
+            test -x /usr/local/bin/gitlab-firstboot.sh
+            test -f /usr/lib/systemd/system/gitlab-firstboot.service
+            test -L /etc/systemd/system/multi-user.target.wants/gitlab-firstboot.service
+            test -f /etc/cloud/cloud.cfg.d/99-gitlab-image-mode.cfg
+      changed_when: false
+
+    ###########################################################################
+    # PHASE 5 | Push image
+    ###########################################################################
+
+    - name: PHASE 5 | Push GitLab image to registry
+      containers.podman.podman_image:
+        name: "{{ gitlab_image_reference }}"
+        push: true
+        tls_verify: "{{ gitlab_registry_validate_certs }}"
+      when: gitlab_push_image
+
+    - name: PHASE 5 | Display build result
+      ansible.builtin.debug:
+        msg:
+          - "GitLab Image Mode image: {{ gitlab_image_reference }}"
+          - "Pushed: {{ gitlab_push_image | bool }}"
+          - >-
+            Supply /etc/gitlab-firstboot.env through Satellite provisioning
+            or cloud-init before gitlab-firstboot.service starts.

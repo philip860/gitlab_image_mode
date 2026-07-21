@@ -1,0 +1,29 @@
+# Image Mode GitLab cloud-init settings.
+# This drop-in avoids replacing the vendor-supplied /etc/cloud/cloud.cfg.
+preserve_hostname: false
+manage_etc_hosts: true
+
+cloud_final_modules:
+  - package-update-upgrade-install
+  - fan
+  - landscape
+  - lxd
+  - ubuntu-drivers
+  - write-files-deferred
+  - puppet
+  - chef
+  - ansible
+  - mcollective
+  - salt-minion
+  - reset-rmc
+  - scripts-vendor
+  - scripts-per-once
+  - scripts-per-boot
+  - scripts-per-instance
+  - scripts-user
+  - ssh-authkey-fingerprints
+  - keys-to-console
+  - install-hotplug
+  - phone-home
+  - final-message
+  - power-state-change

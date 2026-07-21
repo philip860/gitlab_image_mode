@@ -1,0 +1,5 @@
+[image_builder]
+image-builder-1.example.com
+
+[image_builder:vars]
+ansible_user=ec2-user
