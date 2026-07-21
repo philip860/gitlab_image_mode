@@ -1,0 +1,54 @@
+---
+###############################################################################
+# Default variables for the Image Mode GitLab build role
+###############################################################################
+
+###############################################################################
+# Registry discovery
+###############################################################################
+
+# DNS domain of the current environment.
+#
+# Example:
+#
+#   inventory_hostname:
+#     image-builder-1.lab.sandbox4089.opentlc.com
+#
+# becomes:
+#
+#   lab.sandbox4089.opentlc.com
+#
+gitlab_environment_domain: >-
+  {{
+    ansible_domain
+    | default(
+        inventory_hostname.split('.', 1)[1],
+        true
+      )
+  }}
+
+###############################################################################
+# Container registry
+###############################################################################
+
+container_registry_host: >-
+  quay-1.{{ gitlab_environment_domain }}
+
+container_registry: "{{ container_registry_host }}"
+
+container_registry_namespace: image-mode
+
+container_registry_validate_tls: true
+
+###############################################################################
+# Image naming
+###############################################################################
+
+gitlab_image_name: gitlab-rhel10
+
+gitlab_image_tag: latest
+
+gitlab_image: >-
+  {{ container_registry }}/
+  {{ container_registry_namespace }}/
+  {{ gitlab_image_name }}:{{ gitlab_image_tag }}
