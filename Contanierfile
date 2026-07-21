@@ -1,0 +1,25 @@
+FROM registry.redhat.io/rhel10/rhel-bootc:latest
+
+RUN dnf -y install \
+        gitlab-ee \
+        cloud-init \
+        cloud-utils-growpart \
+        openssh-server \
+        chrony \
+        rsync \
+        tar \
+        curl \
+        jq \
+    && dnf clean all
+
+RUN systemctl enable sshd
+RUN systemctl enable cloud-init
+RUN systemctl enable gitlab-runsvdir
+
+RUN usermod -aG wheel ec2-user
+
+COPY cloud.cfg /etc/cloud/cloud.cfg
+
+COPY firstboot.sh /usr/local/bin/
+
+RUN chmod +x /usr/local/bin/firstboot.sh
