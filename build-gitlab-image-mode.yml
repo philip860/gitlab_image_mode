@@ -1,21 +1,5 @@
+
 ---
-###############################################################################
-# Build and optionally push a RHEL Image Mode GitLab bootc container image.
-#
-# Expected inventory group:
-#
-#   [image_builder]
-#   image-builder-1.example.com
-#
-# Required on the builder:
-#
-#   - podman
-#   - access to registry.redhat.io/rhel10/rhel-bootc
-#   - enough free space under gitlab_image_build_root
-#
-# Registry credentials should be supplied through an AAP credential,
-# Ansible Vault, or extra variables. Do not commit passwords.
-###############################################################################
 
 - name: Build Image Mode GitLab bootc image
   hosts: image_builder
@@ -24,45 +8,14 @@
   any_errors_fatal: true
   serial: 1
 
-  vars:
-    ###########################################################################
-    # Build inputs
-    ###########################################################################
-
-    gitlab_image_build_root: /var/lib/image-mode/gitlab
-    gitlab_image_context_dir: "{{ gitlab_image_build_root }}/context"
-
-    gitlab_bootc_base_image: registry.redhat.io/rhel10/rhel-bootc:latest
-    gitlab_package_name: gitlab-ee
-    gitlab_package_version: ""
-    gitlab_repository_setup_url: >-
-      https://packages.gitlab.com/install/repositories/gitlab/gitlab-ee/script.rpm.sh
-
-    ###########################################################################
-    # Output image
-    ###########################################################################
-
-    gitlab_image_registry: quay.example.com
-    gitlab_image_namespace: image-mode
-    gitlab_image_name: gitlab-rhel10
-    gitlab_image_tag: latest
-    gitlab_image_reference: >-
-      {{ gitlab_image_registry }}/{{ gitlab_image_namespace }}/
-      {{- gitlab_image_name }}:{{ gitlab_image_tag }}
-
-    ###########################################################################
-    # Registry authentication
-    ###########################################################################
-
-    gitlab_registry_username: ""
-    gitlab_registry_password: ""
-    gitlab_registry_validate_certs: true
-
-    gitlab_push_image: false
-    gitlab_force_rebuild: true
-    gitlab_pull_base_image: true
+  vars_files:
+    - defaults/main.yml
 
   pre_tasks:
+    ###########################################################################
+    # PHASE 0 | Validate builder and resolve environment
+    ###########################################################################
+
     - name: PHASE 0 | Validate supported builder operating system
       ansible.builtin.assert:
         that:
@@ -70,20 +23,106 @@
           - ansible_facts.architecture == "x86_64"
         fail_msg: >-
           This playbook requires an x86_64 Red Hat-family image-builder host.
+          Host {{ inventory_hostname }} reports operating-system family
+          {{ ansible_facts.os_family | default('unknown') }} and architecture
+          {{ ansible_facts.architecture | default('unknown') }}.
+
+    - name: PHASE 0 | Validate builder inventory hostname
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname is string
+          - inventory_hostname | length > 0
+          - inventory_hostname is search('\.')
+        fail_msg: >-
+          The image-builder inventory hostname must be a fully qualified domain
+          name so the environment domain can be derived automatically.
+
+          Received:
+
+            {{ inventory_hostname }}
+
+          Expected a hostname similar to:
+
+            image-builder-1.lab.sandbox4089.opentlc.com
+
+    - name: PHASE 0 | Derive environment domain from builder hostname
+      ansible.builtin.set_fact:
+        gitlab_resolved_environment_domain: >-
+          {{
+            gitlab_environment_domain
+            | default(
+                inventory_hostname.split('.', 1)[1],
+                true
+              )
+          }}
+
+    - name: PHASE 0 | Resolve destination registry hostname
+      ansible.builtin.set_fact:
+        gitlab_resolved_registry: >-
+          {{
+            container_registry
+            | default(
+                (
+                  container_registry_hostname
+                  | default('quay-1', true)
+                )
+                ~ '.'
+                ~ gitlab_resolved_environment_domain,
+                true
+              )
+          }}
+
+    - name: PHASE 0 | Resolve full GitLab image reference
+      ansible.builtin.set_fact:
+        gitlab_resolved_image_reference: >-
+          {{
+            gitlab_resolved_registry
+            ~ '/'
+            ~ gitlab_image_namespace
+            ~ '/'
+            ~ gitlab_image_name
+            ~ ':'
+            ~ gitlab_image_tag
+          }}
 
     - name: PHASE 0 | Validate build variables
       ansible.builtin.assert:
         that:
           - gitlab_bootc_base_image | length > 0
-          - gitlab_image_registry | length > 0
+          - gitlab_image_build_root | length > 0
+          - gitlab_image_context_dir | length > 0
+          - gitlab_resolved_environment_domain | length > 0
+          - gitlab_resolved_registry | length > 0
           - gitlab_image_namespace | length > 0
           - gitlab_image_name | length > 0
           - gitlab_image_tag | length > 0
-          - not gitlab_push_image or gitlab_registry_username | length > 0
-          - not gitlab_push_image or gitlab_registry_password | length > 0
+          - gitlab_resolved_image_reference | length > 0
+          - not gitlab_push_image | bool or gitlab_registry_username | length > 0
+          - not gitlab_push_image | bool or gitlab_registry_password | length > 0
         fail_msg: >-
-          Image coordinates are required. Registry credentials are also
-          required when gitlab_push_image=true.
+          One or more required image build variables are missing.
+
+          Registry credentials are also required when
+          gitlab_push_image=true.
+
+    - name: PHASE 0 | Display resolved build configuration
+      ansible.builtin.debug:
+        msg:
+          - >-
+            Builder:
+            {{ inventory_hostname }}
+          - >-
+            Environment domain:
+            {{ gitlab_resolved_environment_domain }}
+          - >-
+            Destination registry:
+            {{ gitlab_resolved_registry }}
+          - >-
+            Image reference:
+            {{ gitlab_resolved_image_reference }}
+          - >-
+            Push image:
+            {{ gitlab_push_image | bool }}
 
   tasks:
     ###########################################################################
@@ -98,7 +137,7 @@
           - jq
         state: present
 
-    - name: PHASE 1 | Create GitLab image build context
+    - name: PHASE 1 | Create GitLab image build directories
       ansible.builtin.file:
         path: "{{ item.path }}"
         state: directory
@@ -108,8 +147,25 @@
       loop:
         - path: "{{ gitlab_image_build_root }}"
           mode: "0750"
+
         - path: "{{ gitlab_image_context_dir }}"
           mode: "0750"
+
+    - name: PHASE 1 | Verify Podman is available
+      ansible.builtin.command:
+        argv:
+          - podman
+          - version
+      register: gitlab_podman_version
+      changed_when: false
+
+    - name: PHASE 1 | Verify Skopeo is available
+      ansible.builtin.command:
+        argv:
+          - skopeo
+          - --version
+      register: gitlab_skopeo_version
+      changed_when: false
 
     ###########################################################################
     # PHASE 2 | Stage immutable image content
@@ -145,19 +201,46 @@
     - name: PHASE 2 | Render cloud-init configuration drop-in
       ansible.builtin.template:
         src: templates/99-gitlab-image-mode.cfg.j2
-        dest: "{{ gitlab_image_context_dir }}/99-gitlab-image-mode.cfg"
+        dest: >-
+          {{ gitlab_image_context_dir }}/99-gitlab-image-mode.cfg
         owner: root
         group: root
         mode: "0644"
       register: gitlab_cloud_init_config
 
-    - name: PHASE 2 | Render example deployment environment
+    - name: PHASE 2 | Render example GitLab deployment environment
       ansible.builtin.template:
         src: templates/gitlab-firstboot.env.example.j2
-        dest: "{{ gitlab_image_context_dir }}/gitlab-firstboot.env.example"
+        dest: >-
+          {{ gitlab_image_context_dir }}/gitlab-firstboot.env.example
         owner: root
         group: root
         mode: "0600"
+      register: gitlab_firstboot_environment_example
+
+    - name: PHASE 2 | Validate staged build context files
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ gitlab_image_context_dir }}/Containerfile"
+        - "{{ gitlab_image_context_dir }}/gitlab-firstboot.sh"
+        - "{{ gitlab_image_context_dir }}/gitlab-firstboot.service"
+        - "{{ gitlab_image_context_dir }}/99-gitlab-image-mode.cfg"
+        - "{{ gitlab_image_context_dir }}/gitlab-firstboot.env.example"
+      register: gitlab_staged_build_files
+
+    - name: PHASE 2 | Assert required build context files exist
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.isreg
+        fail_msg: >-
+          Required GitLab image build context file is missing:
+
+            {{ item.item }}
+      loop: "{{ gitlab_staged_build_files.results }}"
+      loop_control:
+        label: "{{ item.item }}"
 
     ###########################################################################
     # PHASE 3 | Authenticate and pull base image
@@ -165,19 +248,29 @@
 
     - name: PHASE 3 | Log in to destination registry
       containers.podman.podman_login:
-        registry: "{{ gitlab_image_registry }}"
+        registry: "{{ gitlab_resolved_registry }}"
         username: "{{ gitlab_registry_username }}"
         password: "{{ gitlab_registry_password }}"
-        tlsverify: "{{ gitlab_registry_validate_certs }}"
+        tlsverify: "{{ gitlab_registry_validate_certs | bool }}"
       no_log: true
-      when: gitlab_push_image
+      when: gitlab_push_image | bool
 
     - name: PHASE 3 | Pull current bootc base image
       containers.podman.podman_image:
         name: "{{ gitlab_bootc_base_image }}"
         pull: true
         force: true
-      when: gitlab_pull_base_image
+      when: gitlab_pull_base_image | bool
+
+    - name: PHASE 3 | Inspect bootc base image
+      ansible.builtin.command:
+        argv:
+          - podman
+          - image
+          - inspect
+          - "{{ gitlab_bootc_base_image }}"
+      register: gitlab_base_image_inspect
+      changed_when: false
 
     ###########################################################################
     # PHASE 4 | Build and validate image
@@ -185,16 +278,22 @@
 
     - name: PHASE 4 | Build GitLab bootc container image
       containers.podman.podman_image:
-        name: "{{ gitlab_image_reference }}"
+        name: "{{ gitlab_resolved_image_reference }}"
         path: "{{ gitlab_image_context_dir }}"
         build:
           file: Containerfile
           format: oci
-          cache: "{{ not gitlab_force_rebuild }}"
+          cache: "{{ not gitlab_force_rebuild | bool }}"
           extra_args: >-
-            --label org.opencontainers.image.title=Image-Mode-GitLab
-            --label org.opencontainers.image.description=RHEL-10-bootc-GitLab
-        force: "{{ gitlab_force_rebuild }}"
+            --label
+            org.opencontainers.image.title=Image-Mode-GitLab
+            --label
+            org.opencontainers.image.description=RHEL-10-bootc-GitLab
+            --label
+            org.opencontainers.image.vendor=Image-Mode-Lab
+            --label
+            org.opencontainers.image.version={{ gitlab_image_tag }}
+        force: "{{ gitlab_force_rebuild | bool }}"
         pull: false
         push: false
       register: gitlab_image_build
@@ -205,9 +304,27 @@
           - podman
           - image
           - inspect
-          - "{{ gitlab_image_reference }}"
+          - "{{ gitlab_resolved_image_reference }}"
       register: gitlab_image_inspect
       changed_when: false
+
+    - name: PHASE 4 | Parse built image inspection data
+      ansible.builtin.set_fact:
+        gitlab_image_inspect_data: >-
+          {{
+            gitlab_image_inspect.stdout
+            | from_json
+          }}
+
+    - name: PHASE 4 | Validate built image inspection data
+      ansible.builtin.assert:
+        that:
+          - gitlab_image_inspect_data is sequence
+          - gitlab_image_inspect_data | length > 0
+          - gitlab_image_inspect_data[0].Id | default('') | length > 0
+        fail_msg: >-
+          Podman did not return valid inspection information for
+          {{ gitlab_resolved_image_reference }}.
 
     - name: PHASE 4 | Validate required image files and commands
       ansible.builtin.command:
@@ -217,35 +334,111 @@
           - --rm
           - --entrypoint
           - /bin/bash
-          - "{{ gitlab_image_reference }}"
+          - "{{ gitlab_resolved_image_reference }}"
           - -ceu
           - |
             command -v bootc
             command -v gitlab-ctl
             command -v cloud-init
             command -v sshd
+            command -v curl
+            command -v flock
+
             test -x /usr/local/bin/gitlab-firstboot.sh
-            test -f /usr/lib/systemd/system/gitlab-firstboot.service
-            test -L /etc/systemd/system/multi-user.target.wants/gitlab-firstboot.service
-            test -f /etc/cloud/cloud.cfg.d/99-gitlab-image-mode.cfg
+
+            test -f \
+              /usr/lib/systemd/system/gitlab-firstboot.service
+
+            test -L \
+              /etc/systemd/system/multi-user.target.wants/gitlab-firstboot.service
+
+            test -f \
+              /etc/cloud/cloud.cfg.d/99-gitlab-image-mode.cfg
+
+            test -f \
+              /usr/share/doc/gitlab-image-mode/gitlab-firstboot.env.example
+      register: gitlab_image_content_validation
+      changed_when: false
+
+    - name: PHASE 4 | Run bootc container lint
+      ansible.builtin.command:
+        argv:
+          - podman
+          - run
+          - --rm
+          - --privileged
+          - --entrypoint
+          - bootc
+          - "{{ gitlab_resolved_image_reference }}"
+          - container
+          - lint
+      register: gitlab_bootc_container_lint
       changed_when: false
 
     ###########################################################################
     # PHASE 5 | Push image
     ###########################################################################
 
-    - name: PHASE 5 | Push GitLab image to registry
+    - name: PHASE 5 | Push GitLab image to destination registry
       containers.podman.podman_image:
-        name: "{{ gitlab_image_reference }}"
+        name: "{{ gitlab_resolved_image_reference }}"
         push: true
-        tls_verify: "{{ gitlab_registry_validate_certs }}"
-      when: gitlab_push_image
+        tls_verify: "{{ gitlab_registry_validate_certs | bool }}"
+      register: gitlab_image_push
+      when: gitlab_push_image | bool
+
+    - name: PHASE 5 | Inspect pushed image in destination registry
+      ansible.builtin.command:
+        argv:
+          - skopeo
+          - inspect
+          - >-
+            --tls-verify={{
+              gitlab_registry_validate_certs
+              | bool
+              | ternary('true', 'false')
+            }}
+          - "docker://{{ gitlab_resolved_image_reference }}"
+      register: gitlab_remote_image_inspect
+      changed_when: false
+      no_log: >-
+        {{
+          gitlab_registry_username | length > 0
+          or
+          gitlab_registry_password | length > 0
+        }}
+      when: gitlab_push_image | bool
 
     - name: PHASE 5 | Display build result
       ansible.builtin.debug:
         msg:
-          - "GitLab Image Mode image: {{ gitlab_image_reference }}"
-          - "Pushed: {{ gitlab_push_image | bool }}"
+          - >-
+            GitLab Image Mode image:
+            {{ gitlab_resolved_image_reference }}
+
+          - >-
+            Builder:
+            {{ inventory_hostname }}
+
+          - >-
+            Environment domain:
+            {{ gitlab_resolved_environment_domain }}
+
+          - >-
+            Destination registry:
+            {{ gitlab_resolved_registry }}
+
+          - >-
+            Image pushed:
+            {{ gitlab_push_image | bool }}
+
+          - >-
+            Local image ID:
+            {{
+              gitlab_image_inspect_data[0].Id
+              | default('unknown')
+            }}
+
           - >-
             Supply /etc/gitlab-firstboot.env through Satellite provisioning
             or cloud-init before gitlab-firstboot.service starts.
